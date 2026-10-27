@@ -1,12 +1,13 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
-
 import '../models/produto.dart';
 import '../services/api_service.dart';
 import '../services/auth_service.dart';
 import '../services/carrinho_service.dart';
 import 'perfil_page.dart';
 import 'produto_detalhes_page.dart';
+import 'package:flutter/services.dart';
+import '../widgets/imagem_com_loading.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -29,11 +30,15 @@ class _ItemCarrinho {
 
 class _HomePageState extends State<HomePage> {
   final List<_ItemCarrinho> carrinho = [];
+  final Set<int> produtosCarregando = {};
+
+  bool carregandoInicial = true;
 
   late Future<List<dynamic>> produtosFuture;
   late Future<List<dynamic>> categoriasFuture;
 
-  // Pesquisa
+  int? categoriaSelecionadaId;
+
   final TextEditingController pesquisaController = TextEditingController();
   String termoPesquisa = '';
 
@@ -50,7 +55,53 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     carregarDados();
+    inicializarApp();
     carregarCarrinhoDaApi();
+  }
+
+  Future<void> executarAcaoCarrinho(
+    int produtoId,
+    Future<void> Function() acao,
+  ) async {
+    if (produtosCarregando.contains(produtoId)) return;
+
+    setState(() {
+      produtosCarregando.add(produtoId);
+    });
+
+    try {
+      await acao();
+    } catch (e) {
+      debugPrint('Erro ao atualizar carrinho: $e');
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Não foi possível atualizar o carrinho.'),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          produtosCarregando.remove(produtoId);
+        });
+      }
+    }
+  }
+
+  Future<void> inicializarApp() async {
+    try {
+      await Future.wait([produtosFuture, categoriasFuture]);
+    } catch (e) {
+      debugPrint('Erro ao inicializar o aplicativo: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          carregandoInicial = false;
+        });
+      }
+    }
   }
 
   @override
@@ -65,26 +116,37 @@ class _HomePageState extends State<HomePage> {
   }
 
   // =========================================================
-  // PESQUISA DE PRODUTOS
+  // FILTRAR PRODUTOS POR CATEGORIA E PESQUISA
   // =========================================================
 
   List<Produto> filtrarProdutos(List<Produto> produtos) {
     final termo = termoPesquisa.trim().toLowerCase();
 
-    if (termo.isEmpty) {
-      return produtos;
-    }
-
     return produtos.where((produto) {
-      final nome = produto.nome.toLowerCase();
-      final descricao = produto.descricao.toLowerCase();
-      final categoria = (produto.categoria ?? '').toLowerCase();
+      final correspondePesquisa =
+          termo.isEmpty ||
+          produto.nome.toLowerCase().contains(termo) ||
+          produto.descricao.toLowerCase().contains(termo) ||
+          (produto.categoria ?? '').toLowerCase().contains(termo);
 
-      return nome.contains(termo) ||
-          descricao.contains(termo) ||
-          categoria.contains(termo);
+      // O modelo Produto precisa disponibilizar categoriaId.
+      // A comparação por nome abaixo mantém compatibilidade
+      // com modelos que possuem apenas o nome da categoria.
+      final correspondeCategoria =
+          categoriaSelecionadaId == null ||
+          _categoriaIdDoProduto(produto) == categoriaSelecionadaId;
+
+      return correspondePesquisa && correspondeCategoria;
     }).toList();
   }
+
+  int? _categoriaIdDoProduto(Produto produto) {
+    // Compatibilidade sem exigir categoriaId no modelo Produto.
+    // O ID da categoria é obtido pelo nome usando os dados da API.
+    return _idsCategoriaPorNome[(produto.categoria ?? '').trim().toLowerCase()];
+  }
+
+  final Map<String, int> _idsCategoriaPorNome = {};
 
   Widget _barraPesquisa() {
     return Padding(
@@ -92,9 +154,7 @@ class _HomePageState extends State<HomePage> {
       child: TextField(
         controller: pesquisaController,
         onChanged: (valor) {
-          setState(() {
-            termoPesquisa = valor;
-          });
+          setState(() => termoPesquisa = valor);
         },
         style: const TextStyle(color: branco),
         cursorColor: vermelho,
@@ -107,9 +167,7 @@ class _HomePageState extends State<HomePage> {
                   tooltip: 'Limpar pesquisa',
                   onPressed: () {
                     pesquisaController.clear();
-                    setState(() {
-                      termoPesquisa = '';
-                    });
+                    setState(() => termoPesquisa = '');
                   },
                   icon: const Icon(Icons.close, color: branco),
                 )
@@ -131,7 +189,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   // =========================================================
-  // CARRINHO: CARREGAR DADOS DA API LARAVEL
+  // CARRINHO: CARREGAR DADOS DA API
   // =========================================================
 
   Future<void> carregarCarrinhoDaApi() async {
@@ -145,7 +203,6 @@ class _HomePageState extends State<HomePage> {
 
       for (final item in itensApi) {
         final dadosProduto = item['produto'];
-
         if (dadosProduto == null) continue;
 
         final produto = Produto.fromJson(
@@ -244,7 +301,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   // =========================================================
-  // ATUALIZAR PRODUTOS E CATEGORIAS
+  // ATUALIZAR
   // =========================================================
 
   Future<void> atualizar() async {
@@ -256,10 +313,6 @@ class _HomePageState extends State<HomePage> {
       // Os erros são apresentados na tela.
     }
   }
-
-  // =========================================================
-  // FORMATAÇÃO E CÁLCULOS
-  // =========================================================
 
   String formatarPreco(double preco) {
     return 'R\$ ${preco.toStringAsFixed(2).replaceAll('.', ',')}';
@@ -277,19 +330,16 @@ class _HomePageState extends State<HomePage> {
     return 'http://10.0.2.2:8000/$caminhoLimpo';
   }
 
-  int get quantidadeCarrinho {
-    return carrinho.fold(0, (total, item) => total + item.quantidade);
-  }
+  int get quantidadeCarrinho =>
+      carrinho.fold(0, (total, item) => total + item.quantidade);
 
-  double get subtotal {
-    return carrinho.fold(
-      0.0,
-      (total, item) => total + item.produto.preco * item.quantidade,
-    );
-  }
+  double get subtotal => carrinho.fold(
+    0.0,
+    (total, item) => total + item.produto.preco * item.quantidade,
+  );
 
   // =========================================================
-  // ADICIONAR PRODUTO AO CARRINHO
+  // ADICIONAR AO CARRINHO
   // =========================================================
 
   Future<void> adicionarAoCarrinho(
@@ -311,7 +361,7 @@ class _HomePageState extends State<HomePage> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('${produto.nome} adicionado ao carrinho.'),
-          backgroundColor: superficie,
+          backgroundColor: const Color.fromARGB(255, 236, 236, 236),
           duration: const Duration(seconds: 2),
           action: SnackBarAction(
             label: 'VER CARRINHO',
@@ -334,10 +384,6 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  // =========================================================
-  // ABRIR DETALHES DO PRODUTO
-  // =========================================================
-
   void abrirDetalhesProduto(Produto produto) {
     Navigator.push(
       context,
@@ -353,7 +399,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   // =========================================================
-  // ALTERAR QUANTIDADE NO LARAVEL
+  // ALTERAR QUANTIDADE
   // =========================================================
 
   Future<void> alterarQuantidade(int indice, int variacao) async {
@@ -391,10 +437,6 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  // =========================================================
-  // REMOVER ITEM DO LARAVEL
-  // =========================================================
-
   Future<void> removerItem(int indice) async {
     if (indice < 0 || indice >= carrinho.length) return;
 
@@ -409,7 +451,6 @@ class _HomePageState extends State<HomePage> {
 
     try {
       await CarrinhoService.removerItem(itemId: itemId);
-
       await carregarCarrinhoDaApi();
 
       if (!mounted) return;
@@ -417,7 +458,7 @@ class _HomePageState extends State<HomePage> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('$nome removido do carrinho.'),
-          backgroundColor: superficie,
+          backgroundColor: const Color.fromARGB(255, 236, 236, 236),
         ),
       );
     } catch (e) {
@@ -475,14 +516,18 @@ class _HomePageState extends State<HomePage> {
             ),
         ],
       ),
-      body: IndexedStack(
-        index: paginaSelecionada,
-        children: [
-          _construirInicio(),
-          _construirCarrinho(),
-          const PerfilPage(),
-        ],
-      ),
+
+      body: carregandoInicial
+          ? _telaLoading()
+          : IndexedStack(
+              index: paginaSelecionada,
+              children: [
+                _construirInicio(),
+                _construirCarrinho(),
+                const PerfilPage(),
+              ],
+            ),
+
       bottomNavigationBar: NavigationBar(
         backgroundColor: superficie,
         indicatorColor: vermelho.withValues(alpha: 0.18),
@@ -534,8 +579,6 @@ class _HomePageState extends State<HomePage> {
         padding: const EdgeInsets.only(bottom: 30),
         children: [
           _banner(),
-
-          // Barra de pesquisa
           _barraPesquisa(),
 
           const Padding(
@@ -582,30 +625,72 @@ class _HomePageState extends State<HomePage> {
                   );
                 }
 
+                // Prepara o mapeamento de nome para ID.
+                _idsCategoriaPorNome.clear();
+                for (final item in categorias) {
+                  final id = int.tryParse(item['id'].toString());
+                  final nome = (item['nome'] ?? '')
+                      .toString()
+                      .trim()
+                      .toLowerCase();
+
+                  if (id != null && nome.isNotEmpty) {
+                    _idsCategoriaPorNome[nome] = id;
+                  }
+                }
+
+                final categoriaAtualExiste = categorias.any(
+                  (item) =>
+                      int.tryParse(item['id'].toString()) ==
+                      categoriaSelecionadaId,
+                );
+
+                if (categoriaSelecionadaId != null && !categoriaAtualExiste) {
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (mounted) {
+                      setState(() => categoriaSelecionadaId = null);
+                    }
+                  });
+                }
+
                 return ListView.separated(
                   scrollDirection: Axis.horizontal,
                   padding: const EdgeInsets.symmetric(horizontal: 20),
-                  itemCount: categorias.length,
+                  itemCount: categorias.length + 1,
                   separatorBuilder: (_, _) => const SizedBox(width: 10),
                   itemBuilder: (context, index) {
-                    final categoria = categorias[index];
+                    final bool todas = index == 0;
+                    final categoria = todas ? null : categorias[index - 1];
+                    final int? id = todas
+                        ? null
+                        : int.tryParse(categoria['id'].toString());
 
-                    return Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 18,
-                        vertical: 12,
+                    final selecionada = categoriaSelecionadaId == id;
+
+                    return ChoiceChip(
+                      label: Text(
+                        todas
+                            ? 'Todas'
+                            : categoria['nome']?.toString() ?? 'Categoria',
                       ),
-                      decoration: BoxDecoration(
-                        color: superficie,
+                      selected: selecionada,
+                      onSelected: (_) {
+                        setState(() {
+                          categoriaSelecionadaId = id;
+                        });
+                      },
+                      backgroundColor: superficie,
+                      selectedColor: vermelho,
+                      labelStyle: TextStyle(
+                        color: selecionada ? branco : cinza,
+                        fontWeight: FontWeight.w600,
+                      ),
+                      side: BorderSide(
+                        color: selecionada ? vermelho : const Color(0xFF333333),
+                      ),
+                      showCheckmark: false,
+                      shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: const Color(0xFF333333)),
-                      ),
-                      child: Text(
-                        categoria['nome']?.toString() ?? 'Categoria',
-                        style: const TextStyle(
-                          color: branco,
-                          fontWeight: FontWeight.w600,
-                        ),
                       ),
                     );
                   },
@@ -654,6 +739,10 @@ class _HomePageState extends State<HomePage> {
               final produtos = filtrarProdutos(todosProdutos);
 
               if (produtos.isEmpty) {
+                final temFiltro =
+                    termoPesquisa.trim().isNotEmpty ||
+                    categoriaSelecionadaId != null;
+
                 return Padding(
                   padding: const EdgeInsets.all(30),
                   child: Column(
@@ -661,23 +750,24 @@ class _HomePageState extends State<HomePage> {
                       const Icon(Icons.search_off, size: 55, color: cinza),
                       const SizedBox(height: 12),
                       Text(
-                        termoPesquisa.isEmpty
-                            ? 'Nenhum produto ativo encontrado.'
-                            : 'Nenhum produto encontrado para "$termoPesquisa".',
+                        temFiltro
+                            ? 'Nenhum produto encontrado com os filtros selecionados.'
+                            : 'Nenhum produto ativo encontrado.',
                         textAlign: TextAlign.center,
                         style: const TextStyle(color: cinza, fontSize: 14),
                       ),
-                      if (termoPesquisa.isNotEmpty) ...[
+                      if (temFiltro) ...[
                         const SizedBox(height: 12),
                         TextButton(
                           onPressed: () {
                             pesquisaController.clear();
                             setState(() {
                               termoPesquisa = '';
+                              categoriaSelecionadaId = null;
                             });
                           },
                           child: const Text(
-                            'LIMPAR PESQUISA',
+                            'LIMPAR FILTROS',
                             style: TextStyle(color: vermelho),
                           ),
                         ),
@@ -795,6 +885,8 @@ class _HomePageState extends State<HomePage> {
             itemBuilder: (context, indice) {
               final item = carrinho[indice];
               final caminho = item.produto.caminhoImagem;
+              final chaveCarrinho = item.itemCarrinhoId ?? item.produto.id;
+              final carregando = produtosCarregando.contains(chaveCarrinho);
 
               return Container(
                 padding: const EdgeInsets.all(12),
@@ -812,17 +904,14 @@ class _HomePageState extends State<HomePage> {
                         height: 105,
                         child: caminho == null
                             ? _imagemIndisponivel()
-                            : Image.network(
-                                urlImagem(caminho),
+                            : ImagemComLoading(
+                                url: urlImagem(caminho),
                                 fit: BoxFit.cover,
-                                errorBuilder: (_, _, _) =>
-                                    _imagemIndisponivel(),
+                                placeholder: _imagemIndisponivel(),
                               ),
                       ),
                     ),
-
                     const SizedBox(width: 14),
-
                     Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -836,9 +925,7 @@ class _HomePageState extends State<HomePage> {
                               fontWeight: FontWeight.w700,
                             ),
                           ),
-
                           const SizedBox(height: 8),
-
                           Text(
                             formatarPreco(item.produto.preco),
                             style: const TextStyle(
@@ -847,14 +934,17 @@ class _HomePageState extends State<HomePage> {
                               fontSize: 16,
                             ),
                           ),
-
                           const SizedBox(height: 8),
-
                           Row(
                             children: [
                               _botaoQuantidade(
                                 icone: Icons.remove,
-                                aoTocar: () => alterarQuantidade(indice, -1),
+                                carregando: carregando,
+                                aoTocar: () {
+                                  executarAcaoCarrinho(chaveCarrinho, () async {
+                                    await alterarQuantidade(indice, -1);
+                                  });
+                                },
                               ),
 
                               Padding(
@@ -872,19 +962,41 @@ class _HomePageState extends State<HomePage> {
 
                               _botaoQuantidade(
                                 icone: Icons.add,
-                                aoTocar: () => alterarQuantidade(indice, 1),
+                                carregando: carregando,
+                                aoTocar: () {
+                                  executarAcaoCarrinho(chaveCarrinho, () async {
+                                    await alterarQuantidade(indice, 1);
+                                  });
+                                },
                               ),
 
                               const Spacer(),
 
-                              IconButton(
-                                tooltip: 'Remover produto',
-                                onPressed: () => removerItem(indice),
-                                icon: const Icon(
-                                  Icons.delete_outline,
-                                  color: vermelho,
+                              if (carregando)
+                                const SizedBox(
+                                  width: 22,
+                                  height: 22,
+                                  child: CircularProgressIndicator(
+                                    color: vermelho,
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              else
+                                IconButton(
+                                  tooltip: 'Remover produto',
+                                  onPressed: () {
+                                    executarAcaoCarrinho(
+                                      chaveCarrinho,
+                                      () async {
+                                        await removerItem(indice);
+                                      },
+                                    );
+                                  },
+                                  icon: const Icon(
+                                    Icons.delete_outline,
+                                    color: vermelho,
+                                  ),
                                 ),
-                              ),
                             ],
                           ),
                         ],
@@ -924,16 +1036,12 @@ class _HomePageState extends State<HomePage> {
                     ),
                   ],
                 ),
-
                 const SizedBox(height: 8),
-
                 const Text(
                   'Frete e pagamento serão calculados na finalização.',
                   style: TextStyle(color: cinza, fontSize: 11),
                 ),
-
                 const SizedBox(height: 14),
-
                 SizedBox(
                   width: double.infinity,
                   child: ElevatedButton(
@@ -968,16 +1076,13 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // =========================================================
-  // BOTÃO DE QUANTIDADE DO CARRINHO
-  // =========================================================
-
   Widget _botaoQuantidade({
     required IconData icone,
     required VoidCallback aoTocar,
+    bool carregando = false,
   }) {
     return InkWell(
-      onTap: aoTocar,
+      onTap: carregando ? null : aoTocar,
       borderRadius: BorderRadius.circular(6),
       child: Container(
         width: 30,
@@ -986,11 +1091,21 @@ class _HomePageState extends State<HomePage> {
           border: Border.all(color: const Color(0xFF444444)),
           borderRadius: BorderRadius.circular(6),
         ),
-        child: Icon(icone, color: branco, size: 18),
+        child: Center(
+          child: carregando
+              ? const SizedBox(
+                  width: 15,
+                  height: 15,
+                  child: CircularProgressIndicator(
+                    color: vermelho,
+                    strokeWidth: 2,
+                  ),
+                )
+              : Icon(icone, color: branco, size: 18),
+        ),
       ),
     );
   }
-
   // =========================================================
   // BANNER
   // =========================================================
@@ -1020,16 +1135,12 @@ class _HomePageState extends State<HomePage> {
               fontWeight: FontWeight.w900,
             ),
           ),
-
           const SizedBox(height: 12),
-
           const Text(
             'Descubra sua próxima peça favorita.',
             style: TextStyle(color: cinza, fontSize: 14),
           ),
-
           const SizedBox(height: 20),
-
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
             decoration: BoxDecoration(
@@ -1075,14 +1186,13 @@ class _HomePageState extends State<HomePage> {
                 width: double.infinity,
                 child: caminho == null
                     ? _imagemIndisponivel()
-                    : Image.network(
-                        urlImagem(caminho),
+                    : ImagemComLoading(
+                        url: urlImagem(caminho),
                         fit: BoxFit.cover,
-                        errorBuilder: (_, _, _) => _imagemIndisponivel(),
+                        placeholder: _imagemIndisponivel(),
                       ),
               ),
             ),
-
             Padding(
               padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
               child: Column(
@@ -1099,9 +1209,7 @@ class _HomePageState extends State<HomePage> {
                         letterSpacing: 1,
                       ),
                     ),
-
                   const SizedBox(height: 5),
-
                   Text(
                     produto.nome,
                     maxLines: 2,
@@ -1112,9 +1220,7 @@ class _HomePageState extends State<HomePage> {
                       fontSize: 14,
                     ),
                   ),
-
                   const SizedBox(height: 8),
-
                   Text(
                     formatarPreco(produto.preco),
                     style: const TextStyle(
@@ -1123,9 +1229,7 @@ class _HomePageState extends State<HomePage> {
                       fontSize: 16,
                     ),
                   ),
-
                   const SizedBox(height: 10),
-
                   SizedBox(
                     width: double.infinity,
                     child: ElevatedButton.icon(
@@ -1155,10 +1259,6 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // =========================================================
-  // IMAGEM INDISPONÍVEL
-  // =========================================================
-
   Widget _imagemIndisponivel() {
     return Container(
       color: const Color(0xFF222222),
@@ -1168,32 +1268,72 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // =========================================================
-  // ERRO AO CARREGAR PRODUTOS
-  // =========================================================
-
   Widget _mensagemErro() {
     return Padding(
       padding: const EdgeInsets.all(24),
       child: Column(
         children: [
           const Icon(Icons.cloud_off_outlined, color: vermelho, size: 44),
-
           const SizedBox(height: 12),
-
           const Text(
             'Não foi possível carregar os produtos.',
             textAlign: TextAlign.center,
             style: TextStyle(color: branco),
           ),
-
           const SizedBox(height: 12),
-
           ElevatedButton(
             onPressed: atualizar,
             child: const Text('Tentar novamente'),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _telaLoading() {
+    return Container(
+      color: fundo,
+      width: double.infinity,
+      height: double.infinity,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'VÂNDALA',
+              style: TextStyle(
+                color: branco,
+                fontSize: 34,
+                fontWeight: FontWeight.w900,
+                letterSpacing: 8,
+              ),
+            ),
+
+            const SizedBox(height: 30),
+
+            SizedBox(
+              width: 45,
+              height: 45,
+              child: CircularProgressIndicator(
+                strokeWidth: 3,
+                color: vermelho,
+                backgroundColor: superficie,
+              ),
+            ),
+
+            const SizedBox(height: 24),
+
+            const Text(
+              'PREPARANDO SEU ESTILO...',
+              style: TextStyle(
+                color: cinza,
+                fontSize: 12,
+                letterSpacing: 2,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
